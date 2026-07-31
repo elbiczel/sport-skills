@@ -1,0 +1,6 @@
+# Secrets — API keys and OAuth tokens, never commit
+**/data/credentials.json
+**/data/tokens.json
+
+__pycache__/
+*.pyc
