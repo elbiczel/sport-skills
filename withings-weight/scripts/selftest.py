@@ -224,7 +224,15 @@ def test_weekly_selection() -> None:
     with_prev = [r for r in rows[1:] if r["morning_mean"] is not None]
     check("later rows carry a morning delta", all(r["morning_delta"] is not None for r in with_prev))
     trend = withings.format_weekly_trend(rows)
-    check("trend table: header + weeks + footer", len(trend) == 2 + len(rows) + 2, str(len(trend)))
+    check("trend table: header + weeks + footer", len(trend) == 2 + len(rows) + 3, str(len(trend)))
+    check("trend table has a fat% column and the DEXA caveat",
+          "fat%" in trend[0] and "DEXA" in trend[-1], trend[-1])
+    for row in rows:
+        fats = [m["fat_ratio"] for m in row["mornings"] if m["fat_ratio"] is not None]
+        want = round(sum(fats) / len(fats), 1) if fats else None
+        check(f"{row['label']} morning fat mean", row["morning_fat_mean"] == want
+              or (want is not None and abs(row["morning_fat_mean"] - want) <= 0.1),
+              f"{row['morning_fat_mean']} vs {want}")
     check("trend table lists weekday and weight", "Fri 74.80" in trend[4], trend[4])
 
 

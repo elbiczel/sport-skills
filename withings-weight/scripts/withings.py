@@ -195,6 +195,7 @@ def weekly_rows(readings: list, weeks: int | None = 8) -> list:
                     if r.get("first_of_day") and r["weight"] is not None
                     and r["datetime"].hour < MORNING_CUTOFF_HOUR]
         morning_weights = [r["weight"] for r in mornings]
+        morning_fat = [r["fat_ratio"] for r in mornings if r.get("fat_ratio") is not None]
         rows.append({
             "iso_year": iso_year,
             "iso_week": iso_week,
@@ -211,8 +212,15 @@ def weekly_rows(readings: list, weeks: int | None = 8) -> list:
             "morning_mean": (round(sum(morning_weights) / len(morning_weights), 2)
                              if morning_weights else None),
             "morning_delta": None,
+            # Impedance body fat: biased low against the DEXA (see SKILL.md), so
+            # only its slow trend means anything. Same morning readings, averaged.
+            "morning_fat_mean": (round(sum(morning_fat) / len(morning_fat), 1)
+                                 if morning_fat else None),
             "mornings": [{"date": r["date"], "weekday": r["weekday"], "time": r["time"],
-                          "weight": round(r["weight"], 2)} for r in mornings],
+                          "weight": round(r["weight"], 2),
+                          "fat_ratio": (round(r["fat_ratio"], 1)
+                                        if r.get("fat_ratio") is not None else None)}
+                         for r in mornings],
         })
 
     # Deltas come off the rounded weights so the column always reconciles with
@@ -294,8 +302,8 @@ def format_weekly_trend(rows: list) -> list:
     older single-reading layout.
     """
     out = [
-        f"{'week':<9} {'mornings':>8} {'mean':>7} {'delta':>7} {'Friday':>7}  morning readings",
-        f"{'-'*9} {'-'*8} {'-'*7} {'-'*7} {'-'*7}  {'-'*16}",
+        f"{'week':<9} {'mornings':>8} {'mean':>7} {'delta':>7} {'Friday':>7} {'fat%':>6}  morning readings",
+        f"{'-'*9} {'-'*8} {'-'*7} {'-'*7} {'-'*7} {'-'*6}  {'-'*16}",
     ]
     for row in rows:
         mean = f"{row['morning_mean']:.2f}" if row["morning_mean"] is not None else "-"
@@ -306,10 +314,13 @@ def format_weekly_trend(rows: list) -> list:
         other = row["n_readings"] - row["n_mornings"]
         if other:
             listing += f"   (+{other} other, not averaged)"
-        out.append(f"{row['label']:<9} {row['n_mornings']:>8} {mean:>7} {delta:>7} {friday:>7}  {listing}")
+        fat = f"{row['morning_fat_mean']:.1f}" if row.get("morning_fat_mean") is not None else "-"
+        out.append(f"{row['label']:<9} {row['n_mornings']:>8} {mean:>7} {delta:>7} {friday:>7} {fat:>6}  {listing}")
     out.append("")
     out.append("Trend = change in the morning mean, week on week. Trust it when both weeks "
                "have 3+ mornings; with fewer, compare Friday to Friday.")
+    out.append("fat% = mean impedance body fat on those mornings. It reads ~10 points under the "
+               "Sept 2026 DEXA (21.6 %), so read its direction over 4+ weeks, never its level.")
     return out
 
 

@@ -11,10 +11,20 @@ composition the scale recorded - from the Withings Health API. Running lives in
 
 ## Weight is the signal; the composition fields are context
 
-The scale estimates body fat by bioelectrical impedance, and that number is
-**known to disagree with the user's DEXA scan**. Print the composition fields,
-but do not build logic on them, do not trend them, and do not treat a fat-ratio
-move as evidence of anything. **Weight is the number to trend.**
+The scale estimates body fat by bioelectrical impedance, and its **level is
+wrong**: it read ~11 % in the week the user's DEXA scan (Sept 11, 2026) measured
+21.6 %. Never quote the scale's body fat as the user's body fat, and never
+compute fat or lean mass in kg from it.
+
+Its **slow trend is still worth reading.** Impedance error is mostly a stable
+offset for one person on one scale, so the direction of the weekly morning mean
+over four or more weeks is informative. Week to week it is not: hydration and
+glycogen move it by a point or more, and it reads differently the morning after
+a long run. `weekly` prints the morning-mean `fat%` beside the weight. When you
+report it, give the direction over the longest span available and state the DEXA
+misalignment in the same breath. The next DEXA (planned Dec 2026) will show
+whether the offset held. **Weight is the primary trend; fat% is a secondary,
+long-horizon one.**
 
 Even weight is only comparable like-for-like: **morning readings, before coffee.**
 An evening reading after a long run can differ by more than a kilogram from the
@@ -133,10 +143,10 @@ today` - that is the comparable one; the others are same-day noise.
 
 ```
 $ uv run withings.py weekly --weeks 2
-week      mornings    mean   delta  Friday  morning readings
---------- -------- ------- ------- -------  ----------------
-2026-W38         2   74.95       -   74.78  Wed 75.13 · Fri 74.78   (+2 other, not averaged)
-2026-W39         5   74.62   -0.33   74.50  Mon 74.90 · Tue 74.70 · Wed 74.60 · Thu 74.40 · Fri 74.50
+week      mornings    mean   delta  Friday   fat%  morning readings
+--------- -------- ------- ------- ------- ------  ----------------
+2026-W38         2   74.95       -   74.78   10.3  Wed 75.13 · Fri 74.78   (+2 other, not averaged)
+2026-W39         5   74.62   -0.33   74.50   10.6  Mon 74.90 · Tue 74.70 · Wed 74.60 · Thu 74.40 · Fri 74.50
 ```
 
 Rows run **oldest first**, so `delta` is always against the row above. `mean`
