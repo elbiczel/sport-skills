@@ -61,6 +61,12 @@ ATTRIB_LABELS = {
 # pure: decoding
 # ---------------------------------------------------------------------------
 
+# A weigh-in counts as a comparable morning reading when it is the first of its
+# local day and was taken before this hour. Evening readings run ~0.5-1 kg
+# heavier and would drag a weekly mean upward.
+MORNING_CUTOFF_HOUR = 11
+
+
 def resolve_timezone(body_timezone: str | None = None, name: str = DEFAULT_TZ):
     """Return a tzinfo, preferring the user's zone, then the API's, then UTC.
 
@@ -160,6 +166,12 @@ def weekly_rows(readings: list, weeks: int | None = 8) -> list:
     Friday reading the row falls back to the first reading of that week's latest
     day, and `note` says which day was actually used so a substitution is never
     silently read as a Friday.
+
+    Each row also carries the week's **morning readings** (first of the day,
+    before MORNING_CUTOFF_HOUR), their mean and the change in that mean versus
+    the previous week. With three or more mornings in a week the morning mean is
+    the better trend figure: a single reading carries ~0.5 kg of day-to-day
+    noise from water, salt and glycogen, and averaging removes most of it.
     """
     buckets = {}
     for r in readings:
@@ -179,6 +191,10 @@ def weekly_rows(readings: list, weeks: int | None = 8) -> list:
             note = f"no Friday reading, used {chosen['weekday']}"
 
         weights = [r["weight"] for r in items if r["weight"] is not None]
+        mornings = [r for r in items
+                    if r.get("first_of_day") and r["weight"] is not None
+                    and r["datetime"].hour < MORNING_CUTOFF_HOUR]
+        morning_weights = [r["weight"] for r in mornings]
         rows.append({
             "iso_year": iso_year,
             "iso_week": iso_week,
@@ -191,6 +207,12 @@ def weekly_rows(readings: list, weeks: int | None = 8) -> list:
             "n_readings": len(items),
             "mean_weight": round(sum(weights) / len(weights), 2) if weights else None,
             "delta": None,
+            "n_mornings": len(mornings),
+            "morning_mean": (round(sum(morning_weights) / len(morning_weights), 2)
+                             if morning_weights else None),
+            "morning_delta": None,
+            "mornings": [{"date": r["date"], "weekday": r["weekday"], "time": r["time"],
+                          "weight": round(r["weight"], 2)} for r in mornings],
         })
 
     # Deltas come off the rounded weights so the column always reconciles with
@@ -201,6 +223,15 @@ def weekly_rows(readings: list, weeks: int | None = 8) -> list:
             row["delta"] = round(row["weight"] - previous, 2)
         if row["weight"] is not None:
             previous = row["weight"]
+
+    # Same again for the morning mean, which is the trend to judge the diet on
+    # once a week holds several morning readings.
+    previous = None
+    for row in rows:
+        if previous is not None and row["morning_mean"] is not None:
+            row["morning_delta"] = round(row["morning_mean"] - previous, 2)
+        if row["morning_mean"] is not None:
+            previous = row["morning_mean"]
 
     return rows[-weeks:] if weeks else rows
 
@@ -253,6 +284,32 @@ def format_weekly_rows(rows: list) -> list:
         out.append(f"{row['label']:<9} {used:<16} {weight:>8} {delta:>7} {mean:>8}  "
                    f"{row['note']} ({row['n_readings']} reading"
                    f"{'s' if row['n_readings'] != 1 else ''})")
+    return out
+
+
+def format_weekly_trend(rows: list) -> list:
+    """Weekly table led by the morning mean, with every morning reading listed.
+
+    This is what the `weekly` command prints. `format_weekly_rows` keeps the
+    older single-reading layout.
+    """
+    out = [
+        f"{'week':<9} {'mornings':>8} {'mean':>7} {'delta':>7} {'Friday':>7}  morning readings",
+        f"{'-'*9} {'-'*8} {'-'*7} {'-'*7} {'-'*7}  {'-'*16}",
+    ]
+    for row in rows:
+        mean = f"{row['morning_mean']:.2f}" if row["morning_mean"] is not None else "-"
+        delta = f"{row['morning_delta']:+.2f}" if row["morning_delta"] is not None else "-"
+        friday = (f"{row['weight']:.2f}" if row["note"].startswith("Friday")
+                  and row["weight"] is not None else "-")
+        listing = " · ".join(f"{m['weekday']} {m['weight']:.2f}" for m in row["mornings"]) or "none"
+        other = row["n_readings"] - row["n_mornings"]
+        if other:
+            listing += f"   (+{other} other, not averaged)"
+        out.append(f"{row['label']:<9} {row['n_mornings']:>8} {mean:>7} {delta:>7} {friday:>7}  {listing}")
+    out.append("")
+    out.append("Trend = change in the morning mean, week on week. Trust it when both weeks "
+               "have 3+ mornings; with fewer, compare Friday to Friday.")
     return out
 
 
@@ -386,7 +443,7 @@ def _cmd_weekly(args) -> None:
     if not rows:
         print(f"No weigh-ins in the last {args.weeks} weeks.")
         return
-    for line in format_weekly_rows(rows):
+    for line in format_weekly_trend(rows):
         print(line)
 
 

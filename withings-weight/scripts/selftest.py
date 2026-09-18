@@ -205,6 +205,28 @@ def test_weekly_selection() -> None:
     check("formatted table has header + one line per week", len(lines) == 5, str(len(lines)))
     check("formatted delta is signed", "-0.60" in lines[-1], lines[-1])
 
+    # Morning mean: first-of-day readings before MORNING_CUTOFF_HOUR only.
+    for row in rows:
+        expected = [r for r in readings
+                    if r["datetime"].isocalendar()[:2] == (row["iso_year"], row["iso_week"])
+                    and r["first_of_day"] and r["weight"] is not None
+                    and r["datetime"].hour < withings.MORNING_CUTOFF_HOUR]
+        check(f"{row['label']} morning count matches first-of-day-before-cutoff",
+              row["n_mornings"] == len(expected), f"{row['n_mornings']} vs {len(expected)}")
+        if expected:
+            want = round(sum(r["weight"] for r in expected) / len(expected), 2)
+            check(f"{row['label']} morning mean", row["morning_mean"] == want,
+                  f"{row['morning_mean']} vs {want}")
+    check("W36 evening Friday reading is excluded from the morning mean",
+          w36["n_mornings"] == 1 and abs(w36["morning_mean"] - 75.10) < 1e-6,
+          json.dumps(w36["mornings"]))
+    check("first row has no morning delta", rows[0]["morning_delta"] is None)
+    with_prev = [r for r in rows[1:] if r["morning_mean"] is not None]
+    check("later rows carry a morning delta", all(r["morning_delta"] is not None for r in with_prev))
+    trend = withings.format_weekly_trend(rows)
+    check("trend table: header + weeks + footer", len(trend) == 2 + len(rows) + 2, str(len(trend)))
+    check("trend table lists weekday and weight", "Fri 74.80" in trend[4], trend[4])
+
 
 # ---------------------------------------------------------------------------
 

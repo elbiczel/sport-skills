@@ -16,12 +16,17 @@ The scale estimates body fat by bioelectrical impedance, and that number is
 but do not build logic on them, do not trend them, and do not treat a fat-ratio
 move as evidence of anything. **Weight is the number to trend.**
 
-Even weight is only comparable like-for-like: **the Friday reading taken in the
-morning, before coffee, is the comparable one.** An evening reading after a long
-run can differ by more than a kilogram from the same morning's, purely on
-hydration and gut content. The `weekly` command exists to enforce exactly this -
-it picks the first Friday reading of each ISO week and says so when it had to
-substitute another day.
+Even weight is only comparable like-for-like: **morning readings, before coffee.**
+An evening reading after a long run can differ by more than a kilogram from the
+same morning's, purely on hydration and gut content.
+
+**The trend figure is the weekly mean of morning readings**, not one weigh-in. A
+single reading carries about half a kilo of day-to-day noise from water, salt and
+glycogen; averaging a week's mornings removes most of it. `weekly` lists every
+morning reading (first of the day, before 11:00 local), their mean, and the
+change in that mean against the previous week. It also shows the Friday reading,
+which is the fallback comparison when a week has fewer than three mornings.
+**Always read and report all of a week's readings, not just one number.**
 
 ## One-time setup
 
@@ -127,18 +132,19 @@ When a day holds more than one reading, the earliest is marked `* first of N
 today` - that is the comparable one; the others are same-day noise.
 
 ```
-$ uv run withings.py weekly --weeks 3
-week      used               weight   delta     mean  note
---------- ---------------- -------- ------- --------  ----
-2026-W36  2026-09-04 Fri      75.10       -    75.50  Friday, 1st of 2 (2 readings)
-2026-W37  2026-09-12 Sat      75.40   +0.30    75.43  no Friday reading, used Sat (3 readings)
-2026-W38  2026-09-18 Fri      74.80   -0.60    74.80  Friday (1 reading)
+$ uv run withings.py weekly --weeks 2
+week      mornings    mean   delta  Friday  morning readings
+--------- -------- ------- ------- -------  ----------------
+2026-W38         2   74.95       -   74.78  Wed 75.13 · Fri 74.78   (+2 other, not averaged)
+2026-W39         5   74.62   -0.33   74.50  Mon 74.90 · Tue 74.70 · Wed 74.60 · Thu 74.40 · Fri 74.50
 ```
 
 Rows run **oldest first**, so `delta` is always against the row above. `mean`
-averages every reading in that week, not just the chosen one - it moves less
-than a single weigh-in and is the better read when a week is noisy. `note` says
-which day was used, so a substituted day is never mistaken for a Friday.
+is the mean of the morning readings listed on the right; readings later in the
+day, and second readings on the same morning, are counted under "other" and left
+out. `delta` is the change in that mean. Trust it when both weeks have three or
+more mornings; with fewer, compare `Friday` to `Friday`. `--json` also carries
+the older single-reading fields (`weight`, `delta`, `mean_weight`, `note`).
 
 ### Python API
 
@@ -147,7 +153,7 @@ import sys; sys.path.append('withings-weight/scripts')
 from datetime import datetime, timedelta
 from withings import (
     list_measurements, latest_measurement, weekly_summary,
-    describe_measurement, format_weekly_rows,
+    describe_measurement, format_weekly_trend,
 )
 
 for r in list_measurements(since=datetime.now() - timedelta(days=28)):
@@ -155,7 +161,7 @@ for r in list_measurements(since=datetime.now() - timedelta(days=28)):
 
 print(describe_measurement(latest_measurement()))
 
-for line in format_weekly_rows(weekly_summary(weeks=8)):
+for line in format_weekly_trend(weekly_summary(weeks=8)):
     print(line)
 ```
 
