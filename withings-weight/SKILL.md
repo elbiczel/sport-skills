@@ -37,15 +37,20 @@ tokens are then stored locally and refreshed automatically.
 2. Create an application. Choose the **Public API** integration (also called
    *app to app*) - it is the one that needs **no contract** with Withings.
 3. Set **Environment** to `dev`.
-4. Set the **Callback URL** to exactly:
+4. In **Registered URLs**, enter exactly:
 
    ```
-   http://localhost:8765/callback
+   https://elbiczel.github.io/sport-skills/withings-callback/
    ```
 
-   Withings' own OAuth sample registers a loopback callback this way
-   (`http://localhost:5000/get_token`). If the dashboard rejects a `localhost`
-   URL, see *Troubleshooting → the dashboard will not accept localhost*.
+   **The dashboard refuses `localhost` and IP addresses here** (confirmed
+   2026-09-18). That URL is a static relay page served by GitHub Pages out of
+   this repo (`docs/withings-callback/`): it reads `code` and `state` off its own
+   query string and immediately forwards them, unchanged, to the listener that
+   `auth.py authorize` runs on `http://localhost:8765/callback`. The code
+   therefore passes through the browser and appears in GitHub Pages' request log,
+   which is harmless - an authorization code is useless without the client secret
+   and expires 30 seconds after it is issued.
 5. Fill in the remaining fields (name, description, logo) however you like.
 6. Copy the **Client ID** and **Client Secret**.
 
@@ -58,9 +63,24 @@ uv run auth.py init
 # Writes withings-weight/data/credentials.json (git-ignored, chmod 600).
 ```
 
-`--client-id` / `--client-secret` / `--redirect-uri` skip the prompts.
-`WITHINGS_CLIENT_ID` and `WITHINGS_CLIENT_SECRET` in the environment override
-the stored file.
+The defaults are already the relay URL and `http://localhost:8765/callback`, so
+plain `uv run auth.py init` is correct - nothing else needs passing.
+`--client-id` / `--client-secret` skip the prompts; `--redirect-uri` sets the
+registered URL and `--listen` the local address. `WITHINGS_CLIENT_ID` and
+`WITHINGS_CLIENT_SECRET` in the environment override the stored file.
+
+Two addresses, deliberately kept apart:
+
+| | value | who sees it |
+|---|---|---|
+| `redirect_uri` | the https relay page | registered with Withings; sent in the authorize URL **and** echoed back in the token exchange |
+| `listen_uri` | `http://localhost:8765/callback` | only this machine; where `authorize` waits |
+
+**Port 8765 is hardcoded in the relay page.** Pointing `--listen` at another port
+also means editing `docs/withings-callback/index.html` and pushing it, so the
+deployed page keeps matching. (The port is not carried in `state`: that would
+couple a separately-deployed static page to the CLI, and a version skew between
+them would break authorization silently.)
 
 ### 3. Authorize
 
@@ -68,9 +88,11 @@ the stored file.
 uv run auth.py authorize
 ```
 
-This opens the browser, catches the redirect on `localhost:8765`, and exchanges
-the code immediately. **The authorization code is valid for only 30 seconds**,
-which is why this is a local-server flow and not a copy-paste one.
+This starts the local listener, opens the browser, lets the relay page bounce the
+redirect back to `localhost:8765`, and exchanges the code immediately - sending
+Withings the **registered** https URL as `redirect_uri`, not the loopback one.
+**The authorization code is valid for only 30 seconds**, which is why this is a
+local-server flow and not a copy-paste one.
 
 ```bash
 uv run auth.py check     # confirms it works, prints the latest weigh-in
@@ -204,8 +226,10 @@ ambiguous between users, 2 = entered by hand) and a list of `measures`.
 - `scripts/auth.py` - OAuth flow, local callback server, token storage + rotation
 - `scripts/withings.py` - measurement fetching, decoding, weekly summary, CLI
 - `scripts/selftest.py` - offline tests; no credentials, no network
-- `data/credentials.json` - Client ID / Secret / callback URL (git-ignored)
+- `data/credentials.json` - Client ID / Secret / both callback URLs (git-ignored)
 - `data/tokens.json` - access + refresh token, expiry, userid (git-ignored)
+- `../docs/withings-callback/index.html` - the registered relay page (GitHub Pages)
+- `../docs/.nojekyll` - stops Pages running the files through Jekyll
 
 ## Troubleshooting
 
@@ -220,9 +244,23 @@ ambiguous between users, 2 = entered by hand) and a list of `measures`.
   state this run generated, so the code was discarded. Usually a stale browser
   tab from an earlier `authorize`. Close it and re-run.
 - **"Could not bind 127.0.0.1:8765"** - something else holds the port. Free it,
-  or re-run `init` with `--redirect-uri http://localhost:<port>/callback` **and
-  change the Callback URL on the Withings application to match** - the exchange
-  is rejected if the two differ.
+  or re-run `init --listen http://localhost:<port>/callback` **and edit the port
+  in `docs/withings-callback/index.html` and push**, since the deployed relay
+  page is what actually does the forwarding. The *registered* URL does not
+  change.
+- **The browser blocks the https → `http://localhost` hop** - the relay page
+  stays on screen and shows the authorization code with the exact command. Run
+  `uv run auth.py exchange --code <CODE>` **within 30 seconds**; `authorize` can
+  be left running or cancelled, either is fine.
+- **The hop is allowed but the browser shows "connection refused"** - the
+  listener was not running (`authorize` starts it, so this means it had already
+  timed out or was cancelled). The code is still visible in the address bar of
+  that error page: copy it out of the URL and run `exchange --code` within the
+  30 seconds. `location.replace` leaves no history entry, so Back will not return
+  to the relay page.
+- **Withings rejects the redirect at exchange time** - the registered URL and the
+  `redirect_uri` sent in the token call must be byte-identical, trailing slash
+  included. `authorize` sends the registered https URL, never the listener.
 - **Status 304 on exchange** - the authorization code expired. It lasts 30
   seconds; just re-run `authorize`.
 - **Status 342** - the Client ID or Secret is wrong. Re-run `init`.
@@ -231,14 +269,13 @@ ambiguous between users, 2 = entered by hand) and a list of `measures`.
 - **Status 601** - rate limited. Withings wants at most one poll per 10 minutes.
 - **Status 100-102 / 200 / 401** - authentication failed; treated as a token
   problem and retried once after a refresh.
-- **The dashboard will not accept localhost** - Withings' own OAuth sample
-  registers `http://localhost:5000/get_token`, and an archived Withings FAQ
-  claimed localhost and IP addresses were not allowed as callback URLs. If the
-  form refuses it, register a public `https://` URL you control instead, then
-  `uv run auth.py init --redirect-uri https://your.domain/callback` and use the
-  manual path: `uv run auth.py authorize --manual`, then **within 30 seconds**
-  `uv run auth.py exchange --code <CODE>` with the `code` from the redirect.
-  `authorize` switches to this mode by itself for any non-loopback callback URL.
+- **The relay page 404s** - GitHub Pages is not serving `/docs` from `main` yet,
+  or the deploy has not finished. Until it does, use
+  `uv run auth.py authorize --manual` and `exchange --code` within 30 seconds.
+- **Using a different relay or a loopback callback** - `init --redirect-uri`
+  accepts any URL. If the URL given is itself loopback, `authorize` listens on it
+  directly and no relay is involved. `--manual` always falls back to printing the
+  URL and exchanging by hand.
 - **No weigh-ins returned** - confirm the scale actually synced (check the
   Withings app), and that the app was authorized with `user.metrics`.
 - **Testing without a device** - `uv run auth.py authorize --demo` adds

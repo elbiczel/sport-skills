@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Withings callback</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 38rem;
+         padding: 0 1rem; line-height: 1.5; color: #222; }
+  pre { background: #f4f4f5; border: 1px solid #ddd; border-radius: 4px;
+        padding: .7rem; overflow-x: auto; user-select: all; }
+  .bad { color: #b00; font-weight: 600; }
+  .muted { color: #666; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>Withings authorization</h1>
+<div id="out"></div>
+<script>
+(function () {
+  // The Withings dashboard refuses localhost as a registered URL, so this page
+  // is registered instead and bounces the redirect back to the local listener.
+  var LISTEN = 'http://localhost:8765/callback';
+  var out = document.getElementById('out');
+
+  function say(tag, text, cls) {
+    var el = document.createElement(tag);
+    el.textContent = text;
+    if (cls) { el.className = cls; }
+    out.appendChild(el);
+    return el;
+  }
+
+  var q = new URLSearchParams(location.search);
+  var code = q.get('code');
+  var state = q.get('state');
+  var err = q.get('error');
+
+  if (err) {
+    say('p', 'Withings returned an error:', 'bad');
+    say('pre', err);
+    say('p', 'Nothing was saved. Re-run: uv run auth.py authorize');
+    return;
+  }
+
+  if (!code || !state) {
+    say('p', 'This page only handles the Withings OAuth redirect. Nothing to do.');
+    return;
+  }
+
+  // Render the fallback BEFORE navigating: if the browser blocks the https to
+  // http://localhost hop, this is what stays on screen.
+  say('p', 'Forwarding to ' + LISTEN + ' …');
+  say('p', 'Still here? The browser blocked the hop, or nothing is listening. '
+         + 'Copy the code below and run the command within 30 seconds — '
+         + 'the code expires that fast.');
+  say('p', 'Authorization code:', 'muted');
+  say('pre', code);
+  say('p', 'Then run:', 'muted');
+  say('pre', 'uv run auth.py exchange --code ' + code);
+
+  location.replace(LISTEN + location.search);
+})();
+</script>
+</body>
+</html>

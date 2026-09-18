@@ -9,23 +9,37 @@ Handles:
 
 Storage layout (all inside withings-weight/data/):
   - credentials.json  { "client_id": "...", "client_secret": "...",
-                        "redirect_uri": "http://localhost:8765/callback" }
+                        "redirect_uri": "https://.../withings-callback/",
+                        "listen_uri": "http://localhost:8765/callback" }
   - tokens.json       { "access_token": "...", "refresh_token": "...",
                         "expires_at": 1234567890, "userid": 123, "scope": "..." }
 
 Both files are kept out of git (see data/.gitignore) and written chmod 600.
 
-Two Withings quirks drive the design of this file:
+`redirect_uri` and `listen_uri` are deliberately two different things:
+
+  - **redirect_uri** is what Withings knows. It must match a Registered URL on
+    the developer application exactly, and it is sent both in the authorize URL
+    and again in the token exchange. The dashboard refuses `localhost`, so in
+    practice this is an https page.
+  - **listen_uri** is where this process actually waits. The registered https
+    page is a static relay that forwards the redirect, query string intact, to
+    this loopback address.
+
+Three Withings quirks drive the design of this file:
 
   1. The authorization code is valid for **30 seconds**. A copy-paste flow is
      usually too slow, so `authorize` runs a throwaway HTTP server on the
-     loopback address, catches the redirect and exchanges the code in the
-     request handler itself. `exchange --code` stays as a manual fallback.
+     loopback address, catches the (relayed) redirect and exchanges the code in
+     the request handler itself. `exchange --code` stays as a manual fallback.
 
   2. The refresh token **rotates on every refresh**. The old one dies 8 hours
      after the new one is issued, so the new refresh token is written to disk
      atomically (temp file + os.replace) *before* the new access token is used.
      Losing that write means re-running the whole authorize flow.
+
+  3. The developer dashboard **rejects localhost** in Registered URLs, hence the
+     relay split above.
 
 Environment overrides: WITHINGS_CLIENT_ID, WITHINGS_CLIENT_SECRET.
 """
@@ -53,7 +67,14 @@ TOKEN_URL = "https://wbsapi.withings.net/v2/oauth2"
 
 # Only user.metrics is needed for scale measurements.
 DEFAULT_SCOPE = "user.metrics"
-DEFAULT_REDIRECT_URI = "http://localhost:8765/callback"
+
+# Registered on the Withings application. The dashboard refuses localhost in
+# "Registered URLs", so this static GitHub Pages relay stands in for it and
+# forwards the redirect to DEFAULT_LISTEN_URI. Source: docs/withings-callback/.
+DEFAULT_REDIRECT_URI = "https://elbiczel.github.io/sport-skills/withings-callback/"
+# Where this process actually listens. The relay page hardcodes this address,
+# so changing the port means editing docs/withings-callback/index.html too.
+DEFAULT_LISTEN_URI = "http://localhost:8765/callback"
 
 # Withings wrapped-response status codes we care about. status 0 == success.
 STATUS_OK = 0
@@ -123,18 +144,20 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 
 
 def save_credentials(client_id: str, client_secret: str,
-                     redirect_uri: str = DEFAULT_REDIRECT_URI) -> Path:
-    """Persist the developer-app credentials (chmod 600)."""
+                     redirect_uri: str = DEFAULT_REDIRECT_URI,
+                     listen_uri: str = DEFAULT_LISTEN_URI) -> Path:
+    """Persist the developer-app credentials and both callback addresses (chmod 600)."""
     _write_json_atomic(CREDENTIALS_FILE, {
         "client_id": str(client_id).strip(),
         "client_secret": str(client_secret).strip(),
         "redirect_uri": str(redirect_uri).strip(),
+        "listen_uri": str(listen_uri).strip(),
     })
     return CREDENTIALS_FILE
 
 
 def load_credentials() -> dict:
-    """Return {client_id, client_secret, redirect_uri}, env taking precedence."""
+    """Return {client_id, client_secret, redirect_uri, listen_uri}; env wins for the secrets."""
     creds = _read_json(CREDENTIALS_FILE)
     client_id = os.environ.get("WITHINGS_CLIENT_ID") or creds.get("client_id")
     client_secret = os.environ.get("WITHINGS_CLIENT_SECRET") or creds.get("client_secret")
@@ -144,11 +167,27 @@ def load_credentials() -> dict:
             "WITHINGS_CLIENT_ID / WITHINGS_CLIENT_SECRET). Create the developer "
             "app at https://developer.withings.com/dashboard/"
         )
+    redirect_uri = str(creds.get("redirect_uri") or DEFAULT_REDIRECT_URI).strip()
     return {
         "client_id": str(client_id).strip(),
         "client_secret": str(client_secret).strip(),
-        "redirect_uri": str(creds.get("redirect_uri") or DEFAULT_REDIRECT_URI).strip(),
+        "redirect_uri": redirect_uri,
+        "listen_uri": resolve_listen_uri(creds.get("listen_uri"), redirect_uri),
     }
+
+
+def resolve_listen_uri(stored: str | None, redirect_uri: str) -> str:
+    """Decide where to listen locally, given what was stored and the registered URI.
+
+    A credentials.json written before the relay existed has no `listen_uri`; if
+    its redirect_uri is itself loopback, that address is still the right place
+    to wait, so the old direct-to-localhost setup keeps working untouched.
+    """
+    if stored:
+        return str(stored).strip()
+    if is_loopback(redirect_uri):
+        return redirect_uri
+    return DEFAULT_LISTEN_URI
 
 
 def load_tokens() -> dict:
@@ -252,6 +291,15 @@ def exchange_code(code: str, redirect_uri: str | None = None) -> dict:
             ) from e
         raise
     return _store_token_response(body)
+
+
+def make_exchanger(redirect_uri: str):
+    """Return a one-arg exchanger pinned to the REGISTERED redirect_uri.
+
+    The token call must echo the redirect_uri Withings saw in the authorize URL
+    - the https relay page - not the loopback address the request arrived on.
+    """
+    return lambda code: exchange_code(code, redirect_uri=redirect_uri)
 
 
 def refresh_access_token() -> dict:
@@ -400,7 +448,8 @@ def run_callback_server(expected_state: str, port: int, path: str = "/callback",
         raise WithingsAuthError(
             f"Could not bind {host}:{port} ({e.strerror or e}). Something else is "
             f"using that port - free it, or re-run `init` with a different "
-            f"--redirect-uri (and update the callback URL in the Withings dashboard)."
+            f"--listen address (and update the port hardcoded in the relay page, "
+            f"docs/withings-callback/index.html)."
         ) from e
 
     server.timeout = 1.0
@@ -443,35 +492,49 @@ def _cmd_init(args) -> None:
         or input("Withings Client Secret: ").strip()
     if not client_id or not client_secret:
         raise WithingsAuthError("Both Client ID and Client Secret are required.")
-    path = save_credentials(client_id, client_secret, args.redirect_uri)
+    path = save_credentials(client_id, client_secret, args.redirect_uri, args.listen)
     print(f"Saved credentials to {path}")
-    print(f"Callback URL in use: {args.redirect_uri}")
-    print("This must match the Callback URL registered on the Withings app exactly.")
+    print(f"Registered URL (must match the Withings app exactly): {args.redirect_uri}")
+    print(f"Local listener:                                       {args.listen}")
+    if not is_loopback(args.redirect_uri):
+        print("\nThe registered URL is the static relay page; it forwards the")
+        print("redirect to the local listener above.")
 
 
 def _cmd_authorize(args) -> None:
     creds = load_credentials()
     redirect_uri = args.redirect_uri or creds["redirect_uri"]
+    if args.listen:
+        listen_uri = args.listen
+    elif args.redirect_uri and is_loopback(args.redirect_uri):
+        listen_uri = args.redirect_uri          # redirect straight to the listener
+    else:
+        listen_uri = creds["listen_uri"]
     state = secrets.token_urlsafe(24)
     url = build_authorize_url(creds["client_id"], redirect_uri, state,
                               scope=args.scope, demo=args.demo)
 
-    if not is_loopback(redirect_uri) or args.manual:
+    if args.manual or not listen_uri:
         print("Open this URL, authorize, then IMMEDIATELY copy the `code` parameter")
         print("from the redirect and run `uv run auth.py exchange --code <CODE>`.")
         print("The code expires 30 seconds after you click Allow.\n")
         print(url)
         return
 
-    host, port, path = split_redirect_uri(redirect_uri)
-    print(f"Listening on {redirect_uri} for the Withings redirect.")
-    print("If the browser does not open, paste this URL yourself:\n")
+    _host, port, path = split_redirect_uri(listen_uri)
+    print(f"Registered redirect: {redirect_uri}")
+    print(f"Listening locally:   {listen_uri}")
+    if not is_loopback(redirect_uri):
+        print("(the registered page relays the redirect back to the listener)")
+    print("\nIf the browser does not open, paste this URL yourself:\n")
     print(url)
     print()
     if not args.no_browser:
         webbrowser.open(url)
 
-    tokens = run_callback_server(state, port, path, timeout=args.timeout)
+    # The exchange must echo the REGISTERED redirect_uri, not the listener.
+    tokens = run_callback_server(state, port, path, timeout=args.timeout,
+                                 exchange=make_exchanger(redirect_uri))
     print("Tokens saved.")
     print(f"  userid:     {tokens.get('userid')}")
     print(f"  scope:      {tokens.get('scope')}")
@@ -514,16 +577,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Withings OAuth 2.0 helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("init", help="Store Client ID / Client Secret / callback URL")
+    p = sub.add_parser("init", help="Store Client ID / Client Secret / callback URLs")
     p.add_argument("--client-id")
     p.add_argument("--client-secret")
     p.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI,
-                   help=f"default {DEFAULT_REDIRECT_URI}")
+                   help=f"URL registered on the Withings app (default {DEFAULT_REDIRECT_URI})")
+    p.add_argument("--listen", default=DEFAULT_LISTEN_URI,
+                   help=f"local address to wait on (default {DEFAULT_LISTEN_URI})")
     p.set_defaults(func=_cmd_init)
 
     p = sub.add_parser("authorize",
                        help="Open the consent page and catch the redirect locally")
-    p.add_argument("--redirect-uri", help="override the stored callback URL")
+    p.add_argument("--redirect-uri", help="override the registered redirect URL")
+    p.add_argument("--listen", help="override the local listener address")
     p.add_argument("--scope", default=DEFAULT_SCOPE)
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument("--no-browser", action="store_true",

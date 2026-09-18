@@ -12,11 +12,13 @@ local OAuth callback server.
 """
 
 import json
+import re
 import socket
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -437,13 +439,104 @@ def test_port_in_use() -> None:
             check("raises a clear error", False, "no exception")
         except auth.WithingsAuthError as e:
             check("raises a clear error naming the port",
-                  str(port) in str(e) and "redirect-uri" in str(e), str(e))
+                  str(port) in str(e) and "--listen" in str(e), str(e))
+
+
+def test_relay_mode(tmp: Path) -> None:
+    section("relay mode: https registered URL, loopback listener")
+    creds = tmp / "credentials.json"
+    tokens = tmp / "tokens_relay.json"
+    creds.write_text(json.dumps({
+        "client_id": "CID", "client_secret": "CSEC",
+        "redirect_uri": auth.DEFAULT_REDIRECT_URI,
+        "listen_uri": auth.DEFAULT_LISTEN_URI,
+    }))
+    check("registered redirect is https, not loopback",
+          auth.DEFAULT_REDIRECT_URI.startswith("https://")
+          and not auth.is_loopback(auth.DEFAULT_REDIRECT_URI), auth.DEFAULT_REDIRECT_URI)
+    check("listener is loopback", auth.is_loopback(auth.DEFAULT_LISTEN_URI))
+
+    sent = []
+
+    def fake_post(url, data, headers=None):
+        sent.append(dict(data))
+        return {"status": 0, "body": {"access_token": "AT", "refresh_token": "RT",
+                                      "expires_in": 10800, "userid": 9,
+                                      "scope": "user.metrics"}}
+
+    port = free_port()
+    with stubbed(CREDENTIALS_FILE=creds, TOKENS_FILE=tokens, _post_form=fake_post):
+        box = _drive_server("RELAY-STATE", "RELAY-STATE",
+                            auth.make_exchanger(auth.DEFAULT_REDIRECT_URI), port)
+
+    check("listener caught the forwarded redirect", box.get("http_status") == 200,
+          str(box.get("http_status")))
+    check("tokens returned", box.get("result", {}).get("access_token") == "AT",
+          str(box.get("result")))
+    check("exactly one token call", len(sent) == 1, str(len(sent)))
+    check("exchange sent the REGISTERED https redirect_uri",
+          bool(sent) and sent[0].get("redirect_uri") == auth.DEFAULT_REDIRECT_URI,
+          str(sent[:1]))
+    check("exchange did NOT send the loopback listener",
+          bool(sent) and sent[0].get("redirect_uri") != auth.DEFAULT_LISTEN_URI)
+    check("exchange used the authorization_code grant",
+          bool(sent) and sent[0].get("grant_type") == "authorization_code", str(sent[:1]))
+    check("code forwarded intact", bool(sent) and sent[0].get("code") == "CODE123",
+          str(sent[:1]))
+    check("tokens persisted", json.loads(tokens.read_text())["refresh_token"] == "RT")
+
+    # State is still validated on the relayed request.
+    sent.clear()
+    port2 = free_port()
+    with stubbed(CREDENTIALS_FILE=creds, TOKENS_FILE=tokens, _post_form=fake_post):
+        box2 = _drive_server("TAMPERED", "RELAY-STATE",
+                             auth.make_exchanger(auth.DEFAULT_REDIRECT_URI), port2)
+    check("relayed request with a bad state is rejected, nothing exchanged",
+          box2.get("http_status") == 400 and sent == [], str(box2.get("http_status")))
+
+    check("stored listen_uri wins over the https redirect",
+          auth.resolve_listen_uri(auth.DEFAULT_LISTEN_URI, auth.DEFAULT_REDIRECT_URI)
+          == auth.DEFAULT_LISTEN_URI)
+    check("no stored listener + https redirect falls back to the default listener",
+          auth.resolve_listen_uri(None, auth.DEFAULT_REDIRECT_URI)
+          == auth.DEFAULT_LISTEN_URI)
+    check("legacy loopback redirect still listens on itself (back-compat)",
+          auth.resolve_listen_uri(None, "http://localhost:5000/get_token")
+          == "http://localhost:5000/get_token")
+
+
+def test_relay_page() -> None:
+    section("relay page (docs/withings-callback/index.html)")
+    docs = auth.SKILL_DIR.parent / "docs"
+    page = docs / "withings-callback" / "index.html"
+    check("page exists", page.exists(), str(page))
+    if not page.exists():
+        return
+    html = page.read_text()
+    check("forwards to the local listener",
+          auth.DEFAULT_LISTEN_URI in html, auth.DEFAULT_LISTEN_URI)
+    check("uses location.replace", "location.replace" in html)
+    check("passes the query string through", "location.search" in html)
+    check("shows the exchange fallback command", "auth.py exchange --code" in html)
+    check("warns about the 30-second expiry", "30 seconds" in html)
+    check("handles an error param", "'error'" in html)
+    check("noindex", 'name="robots" content="noindex"' in html)
+    check("no-referrer", 'name="referrer" content="no-referrer"' in html)
+
+    urls = [u for u in re.findall(r"https?://[^\s'\"<>)]+", html)
+            if not u.startswith("http://localhost")]
+    check("no external resources or off-localhost URLs", urls == [], str(urls))
+    check("no storage APIs used",
+          not any(s in html for s in ("localStorage", "sessionStorage", "document.cookie")))
+    check("no network calls from the page",
+          not any(s in html for s in ("fetch(", "XMLHttpRequest", "navigator.sendBeacon")))
+    check(".nojekyll present", (docs / ".nojekyll").exists())
 
 
 def test_redirect_uri_parsing() -> None:
     section("redirect URI parsing")
-    check("default splits to host/port/path",
-          auth.split_redirect_uri(auth.DEFAULT_REDIRECT_URI)
+    check("default listener splits to host/port/path",
+          auth.split_redirect_uri(auth.DEFAULT_LISTEN_URI)
           == ("localhost", 8765, "/callback"))
     check("https default port",
           auth.split_redirect_uri("https://example.com/cb") == ("example.com", 443, "/cb"))
@@ -456,6 +549,8 @@ def test_redirect_uri_parsing() -> None:
                                  "state=ST", "scope=user.metrics")), url)
     check("authorize URL points at account.withings.com",
           url.startswith("https://account.withings.com/oauth2_user/authorize2?"), url)
+    check("authorize URL carries the REGISTERED redirect, url-encoded",
+          urllib.parse.quote(auth.DEFAULT_REDIRECT_URI, safe="") in url, url)
 
 
 # ---------------------------------------------------------------------------
@@ -474,9 +569,11 @@ def main() -> int:
         test_token_rotation(tmp)
         test_refresh_failure(tmp)
         test_auto_refresh_retry(tmp)
+        test_relay_mode(tmp)
     test_callback_server_success()
     test_callback_server_state_mismatch()
     test_port_in_use()
+    test_relay_page()
     test_redirect_uri_parsing()
 
     print(f"\n{PASSED} passed, {len(FAILURES)} failed")
